@@ -112,9 +112,42 @@ public class DriverAppIntegrationTest
         verifyComplete(allRuns);
     }
 
+    @Test
+    public void simpleSelectBenchmarkWithRepeatBenchmarkLevel()
+    {
+        setBenchmark("benchmark_with_2_queries");
+        setRepeatLevel(BenchmarkProperties.RepeatLevel.BENCHMARK);
+        verifyBenchmarkStart("benchmark_with_2_queries", "benchmark_with_2_queries_schema=INFORMATION_SCHEMA");
+        verifySerialExecution("benchmark_with_2_queries_schema=INFORMATION_SCHEMA", "simple_select", 1);
+        verifySerialExecution("benchmark_with_2_queries_schema=INFORMATION_SCHEMA", "simple_select_2", 1);
+        verifySerialExecution("benchmark_with_2_queries_schema=INFORMATION_SCHEMA", "simple_select", 2);
+        verifySerialExecution("benchmark_with_2_queries_schema=INFORMATION_SCHEMA", "simple_select_2", 2);
+        verifyBenchmarkFinish("benchmark_with_2_queries_schema=INFORMATION_SCHEMA", ImmutableList.of());
+        verifyComplete(6);
+    }
+
+    @Test
+    public void simpleSelectBenchmarkWithQueryRepeatLevel()
+    {
+        setBenchmark("benchmark_with_2_queries");
+        setRepeatLevel(BenchmarkProperties.RepeatLevel.QUERY);
+        verifyBenchmarkStart("benchmark_with_2_queries", "benchmark_with_2_queries_schema=INFORMATION_SCHEMA");
+        verifySerialExecution("benchmark_with_2_queries_schema=INFORMATION_SCHEMA", "simple_select", 1);
+        verifySerialExecution("benchmark_with_2_queries_schema=INFORMATION_SCHEMA", "simple_select", 2);
+        verifySerialExecution("benchmark_with_2_queries_schema=INFORMATION_SCHEMA", "simple_select_2", 1);
+        verifySerialExecution("benchmark_with_2_queries_schema=INFORMATION_SCHEMA", "simple_select_2", 2);
+        verifyBenchmarkFinish("benchmark_with_2_queries_schema=INFORMATION_SCHEMA", ImmutableList.of());
+        verifyComplete(6);
+    }
+
     private void setBenchmark(String s)
     {
         ReflectionTestUtils.setField(benchmarkProperties, "activeBenchmarks", s);
+    }
+
+    private void setRepeatLevel(BenchmarkProperties.RepeatLevel repeatLevel)
+    {
+        ReflectionTestUtils.setField(benchmarkProperties, "repeatLevel", repeatLevel);
     }
 
     private void verifyBenchmarkStart(String benchmarkName, String uniqueBenchmarkName)
