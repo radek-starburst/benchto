@@ -79,6 +79,9 @@ public class BenchmarkProperties
     @Value("${macroExecutions.healthCheck:#{null}}")
     private String healthCheckMacros;
 
+    @Value("${repeatLevel:QUERY}")
+    private RepeatLevel repeatLevel;
+
     @Value("${macroExecutions.beforeAll:#{null}}")
     private String beforeAllMacros;
 
@@ -171,6 +174,11 @@ public class BenchmarkProperties
         return Paths.get(queryResultsDir);
     }
 
+    public RepeatLevel getRepeatLevel()
+    {
+        return repeatLevel;
+    }
+
     @Override
     public String toString()
     {
@@ -232,5 +240,10 @@ public class BenchmarkProperties
         else {
             throw new IllegalStateException(String.format("Incorrect boolean value: %s.", booleanString));
         }
+    }
+
+    public enum RepeatLevel {
+        QUERY,
+        BENCHMARK
     }
 }
