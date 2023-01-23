@@ -13,6 +13,7 @@
  */
 package io.trino.benchto.driver.execution;
 
+import com.google.common.collect.ImmutableList;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.common.util.concurrent.ListeningExecutorService;
@@ -27,23 +28,39 @@ import io.trino.benchto.driver.listeners.benchmark.BenchmarkStatusReporter;
 import io.trino.benchto.driver.loader.SqlStatementGenerator;
 import io.trino.benchto.driver.macro.MacroService;
 import io.trino.benchto.driver.utils.PermutationUtils;
+import org.apache.commons.math3.util.Pair;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.ApplicationContext;
 import org.springframework.stereotype.Component;
 
+import javax.management.InstanceNotFoundException;
+import javax.management.MBeanException;
+import javax.management.MBeanServerConnection;
+import javax.management.MalformedObjectNameException;
+import javax.management.ObjectInstance;
+import javax.management.ObjectName;
+import javax.management.ReflectionException;
+import javax.management.remote.JMXConnector;
+import javax.management.remote.JMXConnectorFactory;
+import javax.management.remote.JMXServiceURL;
 import javax.sql.DataSource;
 
+import java.io.IOException;
+import java.net.MalformedURLException;
 import java.nio.file.Path;
 import java.sql.Connection;
+import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Statement;
 import java.time.ZonedDateTime;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.function.Function;
@@ -240,8 +257,7 @@ public class BenchmarkExecutionDriver
     }
 
     @SuppressWarnings("unchecked")
-    private List<QueryExecutionResult> executeQueries(List<Benchmark> benchmarks, int runs, boolean warmup, Optional<ZonedDateTime> executionTimeLimit)
-    {
+    private List<QueryExecutionResult> executeQueries(List<Benchmark> benchmarks, int runs, boolean warmup, Optional<ZonedDateTime> executionTimeLimit) throws Exception {
         if (benchmarks.size() == 0) {
             return List.of();
         }
@@ -260,20 +276,162 @@ public class BenchmarkExecutionDriver
             else {
                 int numberOfBenchmarkRuns = properties.getRepeatLevel() == BenchmarkProperties.RepeatLevel.BENCHMARK ? runs : 1;
                 int numberOfQueryRuns = properties.getRepeatLevel() == BenchmarkProperties.RepeatLevel.QUERY ? runs : 1;
-                List<Callable<QueryExecutionResult>> queryExecutionCallables = IntStream.rangeClosed(1, numberOfBenchmarkRuns)
-                        .boxed()
-                        .flatMap(run -> benchmarks.stream()
-                                .flatMap(benchmark -> buildQueryExecutionCallables(benchmark, run, warmup, numberOfQueryRuns).stream()))
-                        .collect(toList());
-                List<ListenableFuture<QueryExecutionResult>> executionFutures = (List) executorService.invokeAll(queryExecutionCallables);
-                return Futures.allAsList(executionFutures).get();
+                int run = 0;
+                ImmutableList.Builder<QueryExecutionResult> builder = ImmutableList.builder();
+                List<String> workers = getActiveWorkers();
+                LOG.info("Active workers " + String.join(",", workers));
+                for (Benchmark benchmark : benchmarks) {
+                    List<Callable<QueryExecutionResult>> queryExecutionCallables = buildQueryExecutionCallables(benchmark, run, warmup, numberOfQueryRuns);
+
+                    Path outputPath = Path.of(String.format("/tmp/aprof/%s.jfr", benchmark.getQueries().stream().map(Query::getName).collect(Collectors.joining(","))));
+
+                    if (!warmup) {
+                        for (String worker : workers) {
+//                            startAsyncProfiler(worker, 9090, outputPath);
+                            startJFRRecording(worker, 9090, outputPath);
+                        }
+                    }
+
+                    List<ListenableFuture<QueryExecutionResult>> executionFutures = (List) executorService.invokeAll(queryExecutionCallables);
+                    builder.addAll(Futures.allAsList(executionFutures).get());
+                    run++;
+
+                    if (!warmup) {
+                        for (String worker : workers) {
+//                            stopAsyncProfiler(worker, 9090);
+                            stopJFRRecording(worker, 9090);
+                        }
+                    }
+
+                }
+                return builder.build();
             }
         }
-        catch (InterruptedException | ExecutionException e) {
+        catch (InterruptedException | ExecutionException | SQLException e) {
             throw new BenchmarkExecutionException("Could not execute benchmark", e);
         }
         finally {
             executorService.shutdown();
+        }
+    }
+
+    private void startAsyncProfiler(String hostname, int port, Path output) throws Exception {
+        JMXConnector jmxConnector = null; // use try with resources
+        try {
+            String url = String.format("service:jmx:rmi:///jndi/rmi://%s:%d/jmxrmi", hostname, port);
+            JMXServiceURL serviceUrl = new JMXServiceURL(url);
+            jmxConnector = JMXConnectorFactory.connect(serviceUrl, null);
+            MBeanServerConnection mbeanConn = jmxConnector.getMBeanServerConnection();
+            Set<ObjectName> mbean = mbeanConn.queryNames(new ObjectName("com.sun.management", "type", "DiagnosticCommand"), null);
+            assert mbean.size() == 1;
+            ObjectName mb = mbean.iterator().next();
+
+            Object startAsyncProfilerCommand[] = {
+                    new String[]{
+                            "/tmp/async-profiler-2.9-linux-arm64/build/libasyncProfiler.so",
+                            "\"start,event=cpu,alloc,file=%s,jfr\"".formatted(output.toString())
+                    }
+            };
+            String opSig[] = {
+                    String[].class.getName()
+            };
+            LOG.info("Starting async profiler for %s [output to %s]".formatted(hostname, output.toString()));
+            Object result = mbeanConn.invoke(mb, "jvmtiAgentLoad", startAsyncProfilerCommand, opSig);
+            if (result != null) {
+                LOG.info("Result of starting is %s. Type of result object is %s".formatted(result.toString(), result.getClass()));
+            }
+        } finally {
+            if (jmxConnector != null) {
+                jmxConnector.close();
+            }
+        }
+    }
+
+    private void stopAsyncProfiler(String hostname, int port) throws Exception {
+        JMXConnector jmxConnector = null; // use try with resources
+        try {
+            String url = String.format("service:jmx:rmi:///jndi/rmi://%s:%d/jmxrmi", hostname, port);
+            JMXServiceURL serviceUrl = new JMXServiceURL(url);
+            jmxConnector = JMXConnectorFactory.connect(serviceUrl, null);
+            MBeanServerConnection mbeanConn = jmxConnector.getMBeanServerConnection();
+            Set<ObjectName> mbean = mbeanConn.queryNames(new ObjectName("com.sun.management", "type", "DiagnosticCommand"), null);
+            assert mbean.size() == 1;
+            ObjectName mb = mbean.iterator().next();
+
+            Object stopAsyncProfilerCommand[] = {
+                    new String[]{
+                            "/tmp/async-profiler-2.9-linux-arm64/build/libasyncProfiler.so",
+                            "\"stop\""
+                    }
+            };
+            String opSig[] = {
+                    String[].class.getName()
+            };
+            LOG.info("Stopping async profiler for %s".formatted(hostname));
+            Object result = mbeanConn.invoke(mb, "jvmtiAgentLoad", stopAsyncProfilerCommand, opSig);
+            if (result != null) {
+                LOG.info("Result of stopping is %s. Type of result object is %s".formatted(result.toString(), result.getClass()));
+            }
+        } finally {
+            if (jmxConnector != null) {
+                jmxConnector.close();
+            }
+        }
+    }
+
+    private void startJFRRecording(String hostname, int port, Path outputPath) throws Exception {
+        JMXConnector jmxConnector = null; // use try with resources
+        try {
+            String url = String.format("service:jmx:rmi:///jndi/rmi://%s:%d/jmxrmi", hostname, port);
+            JMXServiceURL serviceUrl = new JMXServiceURL(url);
+            jmxConnector = JMXConnectorFactory.connect(serviceUrl, null);
+            MBeanServerConnection conn = jmxConnector.getMBeanServerConnection();
+
+            ObjectName on = new ObjectName("com.sun.management:type=DiagnosticCommand");
+            Object[] args = new Object[] {
+                    new String[] {
+                            "dumponexit=true",
+                            "filename=%s".formatted(outputPath.toString()),
+                            "name=%s".formatted("standard")
+                    }
+            };
+            String[] sig = new String[] {"[Ljava.lang.String;"};
+            LOG.info("Starting recording JFR profile for %s".formatted(hostname));
+            Object result = conn.invoke(on, "jfrStart", args, sig);
+            if (result != null) {
+                LOG.info("Result of starting is %s. Type of result object is %s".formatted(result.toString(), result.getClass()));
+            }
+        } finally {
+            if (jmxConnector != null) {
+                jmxConnector.close();
+            }
+        }
+    }
+
+    private void stopJFRRecording(String hostname, int port) throws Exception {
+        JMXConnector jmxConnector = null; // use try with resources
+        try {
+            String url = String.format("service:jmx:rmi:///jndi/rmi://%s:%d/jmxrmi", hostname, port);
+            JMXServiceURL serviceUrl = new JMXServiceURL(url);
+            jmxConnector = JMXConnectorFactory.connect(serviceUrl, null);
+            MBeanServerConnection conn = jmxConnector.getMBeanServerConnection();
+
+            ObjectName on = new ObjectName("com.sun.management:type=DiagnosticCommand");
+            Object[] args = new Object[] {
+                    new String[] {
+                            "name=%s".formatted("standard")
+                    }
+            };
+            String[] sig = new String[] {"[Ljava.lang.String;"};
+            LOG.info("Stopping recording JFR profile for %s".formatted(hostname));
+            Object result = conn.invoke(on, "jfrStop", args, sig);
+            if (result != null) {
+                LOG.info("Result of stopping is %s. Type of result object is %s".formatted(result.toString(), result.getClass()));
+            }
+        } finally {
+            if (jmxConnector != null) {
+                jmxConnector.close();
+            }
         }
     }
 
@@ -410,10 +568,32 @@ public class BenchmarkExecutionDriver
         return result;
     }
 
+    private List<String> getActiveWorkers() throws SQLException {
+        try (Connection connection = getConnectionFor("presto");
+             Statement statement = connection.createStatement();
+             ResultSet resultSet = statement.executeQuery("SELECT * FROM system.runtime.nodes")) {
+
+            ImmutableList.Builder<String> builder = new ImmutableList.Builder<>();
+            while(resultSet.next()) {
+                if (!resultSet.getBoolean("coordinator")) {
+                    String nodeId = resultSet.getString("node_id");
+                    builder.add(nodeId);
+                }
+            }
+            return builder.build();
+        }
+    }
+
     private Connection getConnectionFor(QueryExecution queryExecution)
             throws SQLException
     {
         return applicationContext.getBean(queryExecution.getBenchmark().getDataSource(), DataSource.class).getConnection();
+    }
+
+    private Connection getConnectionFor(String datasource)
+            throws SQLException
+    {
+        return applicationContext.getBean(datasource, DataSource.class).getConnection();
     }
 
     private boolean isTimeLimitExceeded(Optional<ZonedDateTime> executionTimeLimit)

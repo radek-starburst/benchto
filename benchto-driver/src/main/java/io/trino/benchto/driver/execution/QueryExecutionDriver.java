@@ -51,7 +51,7 @@ public class QueryExecutionDriver
         }
     }
 
-    private QueryExecutionResult executeSelectQuery(
+    public QueryExecutionResult executeSelectQuery(
             Connection connection,
             QueryExecutionResultBuilder queryExecutionResultBuilder,
             String sqlStatement,
